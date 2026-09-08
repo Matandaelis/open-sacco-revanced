@@ -77,6 +77,8 @@ def create_repayment_schedule(*, loan: LoanAccount):
 
 def post_installment_repayment(*, loan: LoanAccount, installment_number: int, account, user, narration=""):
     """Debit a member account and settle exactly one scheduled installment."""
+    from groups.models import LedgerEntry, GroupMembership
+
     with transaction.atomic():
         loan = LoanAccount.objects.select_for_update().get(pk=loan.pk)
         if loan.status != LoanAccount.DISBURSED:
@@ -111,6 +113,17 @@ def post_installment_repayment(*, loan: LoanAccount, installment_number: int, ac
         if not loan.schedule.filter(is_paid=False).exists():
             loan.status = LoanAccount.CLOSED
         loan.save(update_fields=["outstanding_principal", "outstanding_interest", "status"])
+
+        # post ledger credit for repayment
+        membership = (
+            GroupMembership.objects.filter(member=loan.member, status="active")
+            .order_by("-join_date")
+            .first()
+        )
+        if membership:
+            group = membership.group
+            LedgerEntry.create_from_source(group=group, amount=installment.total_due, source=payment, entry_type=LedgerEntry.EntryType.CREDIT, created_by=user)
+
         return installment
 
 
@@ -227,6 +240,8 @@ def build_eligibility_summary(application: LoanApplication):
 
 
 def disburse_application(*, application: LoanApplication, account, user, notes=""):
+    from groups.models import LedgerEntry, GroupMembership
+
     with transaction.atomic():
         # Lock the application first so two approval requests cannot credit the
         # member account twice. The account service locks the account row itself.
@@ -268,7 +283,7 @@ def disburse_application(*, application: LoanApplication, account, user, notes="
             narration=notes or f"Loan disbursement for {application.application_number}",
         )
 
-        LoanTransaction.objects.create(
+        tx = LoanTransaction.objects.create(
             loan=loan_account,
             transaction_type=LoanTransaction.DISBURSEMENT,
             amount=application.requested_amount,
@@ -282,6 +297,16 @@ def disburse_application(*, application: LoanApplication, account, user, notes="
             (item.interest_due for item in schedule), Decimal("0.00")
         )
         loan_account.save(update_fields=["outstanding_interest"])
+
+        # post ledger debit for disbursement
+        membership = (
+            GroupMembership.objects.filter(member=application.member, status="active")
+            .order_by("-join_date")
+            .first()
+        )
+        if membership:
+            group = membership.group
+            LedgerEntry.create_from_source(group=group, amount=application.requested_amount, source=tx, entry_type=LedgerEntry.EntryType.DEBIT, created_by=user)
 
         application.status = LoanApplication.Status.DISBURSED
         application.disbursed_by = user
