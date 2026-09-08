@@ -88,3 +88,24 @@ class Posting(models.Model):
 
     def __str__(self):
         return f"{self.entry_type.upper()} {self.amount} -> {self.account.code}"
+
+
+class MigrationRecord(models.Model):
+    """Records which legacy ledger rows have been migrated to JournalEntry.
+
+    This prevents accidental double-migration and provides an audit link to the
+    original LedgerEntry and the created JournalEntry.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    legacy_model = models.CharField(max_length=255)
+    legacy_pk = models.CharField(max_length=255, db_index=True)
+    journal = models.ForeignKey(JournalEntry, on_delete=models.SET_NULL, null=True, blank=True)
+    migrated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("legacy_model", "legacy_pk")
+        ordering = ["-migrated_at"]
+
+    def __str__(self):
+        return f"Migrated {self.legacy_model}:{self.legacy_pk} -> {self.journal_id}"
