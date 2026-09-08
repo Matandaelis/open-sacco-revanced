@@ -5,6 +5,13 @@ import json
 
 from groups.models import LedgerEntry, Contribution
 from accounting.services import post_journal
+from accounting.models import MigrationRecord
+
+# Try to import LoanTransaction for better loan mappings
+try:
+    from loans.models import LoanTransaction
+except Exception:
+    LoanTransaction = None
 
 
 class Command(BaseCommand):
@@ -29,9 +36,23 @@ class Command(BaseCommand):
 
         for entry in qs:
             model = entry.content_type.model if entry.content_type else None
+            legacy_model = model or "ledger"
+            legacy_pk = str(entry.pk)
+
+            # Skip already-migrated rows
+            if MigrationRecord.objects.filter(legacy_model=legacy_model, legacy_pk=legacy_pk).exists():
+                # include a short note in preview
+                preview.append({
+                    "ledger_id": legacy_pk,
+                    "source_model": model,
+                    "skipped": True,
+                    "reason": "already migrated",
+                })
+                continue
+
             mapping = self._map_ledger_entry(entry, model)
             preview.append({
-                "ledger_id": str(entry.pk),
+                "ledger_id": legacy_pk,
                 "source_model": model,
                 "mappings": mapping,
             })
@@ -41,7 +62,17 @@ class Command(BaseCommand):
                 try:
                     postings = mapping.get("postings")
                     if postings:
-                        post_journal(postings=postings, narration=f"Migrated ledger {entry.pk}", source=entry, created_by=None)
+                        journal = post_journal(postings=postings, narration=f"Migrated ledger {entry.pk}", source=entry, created_by=None)
+                        # record migration to avoid duplicate processing
+                        try:
+                            MigrationRecord.objects.create(
+                                legacy_model=legacy_model,
+                                legacy_pk=legacy_pk,
+                                journal=journal,
+                            )
+                        except Exception:
+                            # Non-fatal: if recording fails, still continue but warn in stdout
+                            self.stdout.write(self.style.WARNING(f"Failed to record migration for ledger {entry.pk}"))
                         applied += 1
                 except Exception as exc:
                     self.stdout.write(self.style.ERROR(f"Failed to migrate ledger {entry.pk}: {exc}"))
@@ -61,7 +92,7 @@ class Command(BaseCommand):
 
         Heuristic mapping rules:
           - If source model is 'contribution' -> Debit group:{group}:cash, Credit member:{member}:savings
-          - If source model is 'loantransaction' and entry_type is debit -> Disbursement mapping
+          - If source model is 'loantransaction' and entry_type is debit -> Disbursement mapping (uses LoanTransaction if available)
           - Otherwise fall back to Debit group cash / Credit group savings (neutral)
         """
         postings = []
@@ -106,27 +137,81 @@ class Command(BaseCommand):
                     },
                 ]
         elif model == "loantransaction":
-            # Inspect object_id not guaranteed; use entry_type to guess
-            if entry.entry_type == LedgerEntry.EntryType.DEBIT:
-                # likely a disbursement: debit loan receivable, credit group cash
-                postings = [
-                    {
-                        "account_code": f"member:{entry.object_id}:loan_receivable:{entry.object_id}",
-                        "account_name": f"Loan Receivable {entry.object_id}",
-                        "account_kind": "asset",
-                        "entry_type": "debit",
-                        "amount": str(amount),
-                    },
-                    {
-                        "account_code": f"group:{entry.group.id}:cash",
-                        "account_name": f"{entry.group.name} Cash",
-                        "account_kind": "asset",
-                        "entry_type": "credit",
-                        "amount": str(amount),
-                    },
-                ]
-            else:
-                # repayment-like
+            # Try to resolve the actual LoanTransaction -> LoanAccount -> Member
+            try:
+                if LoanTransaction is not None:
+                    tx = LoanTransaction.objects.select_related("loan", "loan__member").get(pk=entry.object_id)
+                    loan = tx.loan
+                    member = loan.member
+                    if entry.entry_type == LedgerEntry.EntryType.DEBIT:
+                        # disbursement: debit loan receivable (per-loan), credit group cash
+                        postings = [
+                            {
+                                "account_code": f"member:{member.id}:loan_receivable:{loan.id}",
+                                "account_name": f"Loan Receivable {loan.loan_number}",
+                                "account_kind": "asset",
+                                "entry_type": "debit",
+                                "amount": str(amount),
+                            },
+                            {
+                                "account_code": f"group:{entry.group.id}:cash",
+                                "account_name": f"{entry.group.name} Cash",
+                                "account_kind": "asset",
+                                "entry_type": "credit",
+                                "amount": str(amount),
+                            },
+                        ]
+                    else:
+                        # repayment: attempt to split principal/interest if tx has fields
+                        principal = None
+                        interest = None
+                        # try common field names if present
+                        if hasattr(tx, "principal_paid") and hasattr(tx, "interest_paid"):
+                            principal = Decimal(getattr(tx, "principal_paid") or 0)
+                            interest = Decimal(getattr(tx, "interest_paid") or 0)
+                        elif hasattr(tx, "principal") and hasattr(tx, "interest"):
+                            principal = Decimal(getattr(tx, "principal") or 0)
+                            interest = Decimal(getattr(tx, "interest") or 0)
+
+                        postings = []
+                        postings.append({
+                            "account_code": f"group:{entry.group.id}:cash",
+                            "account_name": f"{entry.group.name} Cash",
+                            "account_kind": "asset",
+                            "entry_type": "debit",
+                            "amount": str(amount),
+                        })
+
+                        if principal and principal > 0:
+                            postings.append({
+                                "account_code": f"member:{member.id}:loan_receivable:{loan.id}",
+                                "account_name": f"Loan Receivable {loan.loan_number}",
+                                "account_kind": "asset",
+                                "entry_type": "credit",
+                                "amount": str(principal),
+                            })
+                        if interest and interest > 0:
+                            postings.append({
+                                "account_code": "income:interest",
+                                "account_name": "Interest Income",
+                                "account_kind": "income",
+                                "entry_type": "credit",
+                                "amount": str(interest),
+                            })
+
+                        # If we couldn't split, post as credit to loan receivable
+                        if len(postings) == 1:
+                            postings.append({
+                                "account_code": f"member:{member.id}:loan_receivable:{loan.id}",
+                                "account_name": f"Loan Receivable {loan.loan_number}",
+                                "account_kind": "asset",
+                                "entry_type": "credit",
+                                "amount": str(amount),
+                            })
+                else:
+                    raise Exception("LoanTransaction model not available")
+            except Exception:
+                # fallback to prior generic mapping
                 postings = [
                     {
                         "account_code": f"group:{entry.group.id}:cash",
