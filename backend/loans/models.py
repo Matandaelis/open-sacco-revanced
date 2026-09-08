@@ -1,4 +1,5 @@
-from decimal import Decimal
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+import uuid
 
 from django.conf import settings
 from django.db import models, transaction
@@ -20,8 +21,7 @@ def generate_loan_number():
             .first()
         )
 
-        last_seq = int(last_loan.loan_number.split("-")
-                       [-1]) if last_loan else 0
+        last_seq = int(last_loan.loan_number.split("-")[-1]) if last_loan else 0
         next_seq = last_seq + 1
 
         return f"LN-{year}-{next_seq:05d}"
@@ -373,6 +373,185 @@ class LoanAccount(models.Model):
             self.loan_number = generate_loan_number()
         super().save(*args, **kwargs)
 
+    def approve(self, user):
+        if self.status != self.PENDING:
+            raise ValueError("Only pending loans can be approved.")
+        self.status = self.APPROVED
+        self.approved_at = timezone.now()
+        self.save(update_fields=["status", "approved_at"])
+
+    def _get_member_group(self):
+        # Lazy import to avoid circular imports
+        from groups.models import GroupMembership
+
+        membership = (
+            GroupMembership.objects.filter(member=self.member, status="active")
+            .order_by("-join_date")
+            .first()
+        )
+        if not membership:
+            raise ValueError("Member does not belong to an active savings group.")
+        return membership.group
+
+    def generate_schedule(self):
+        """Generate amortization schedule using the loan product interest type.
+        Uses monthly repayments by default.
+        """
+        getcontext().rounding = ROUND_HALF_UP
+        schedules = []
+        principal = Decimal(self.principal_amount)
+        rate_per_month = (Decimal(self.interest_rate) / Decimal("100")) / Decimal("12")
+        n = int(self.term_months)
+
+        if rate_per_month == 0:
+            monthly_payment = (principal / n).quantize(Decimal("0.01"))
+        else:
+            # annuity formula: A = P * r / (1 - (1+r)^-n)
+            r = rate_per_month
+            monthly_payment = (
+                principal * r / (1 - (1 + r) ** (Decimal(-n)))
+            ).quantize(Decimal("0.01"))
+
+        remaining = principal
+        for i in range(1, n + 1):
+            if Decimal(self.interest_rate) == 0:
+                interest_due = Decimal("0.00")
+            else:
+                interest_due = (remaining * rate_per_month).quantize(Decimal("0.01"))
+            principal_due = (monthly_payment - interest_due).quantize(Decimal("0.01"))
+            if i == n:
+                # adjust last payment to clear any rounding residues
+                principal_due = remaining
+                monthly_payment = (principal_due + interest_due).quantize(Decimal("0.01"))
+
+            schedules.append({
+                "installment_number": i,
+                "principal_due": principal_due,
+                "interest_due": interest_due,
+                "total_due": (principal_due + interest_due).quantize(Decimal("0.01")),
+            })
+            remaining = (remaining - principal_due).quantize(Decimal("0.01"))
+
+        return schedules
+
+    def disburse(self, user, reference=None):
+        """Disburse the loan: create LoanTransaction (disbursement), set status, generate schedule, and post ledger debit to group.
+        """
+        if self.status != self.APPROVED:
+            raise ValueError("Only approved loans can be disbursed.")
+        from groups.models import LedgerEntry
+
+        with transaction.atomic():
+            # create loan transaction
+            ref = reference or f"LD-{uuid.uuid4().hex[:12]}"
+            tx = LoanTransaction.objects.create(
+                loan=self,
+                transaction_type=LoanTransaction.DISBURSEMENT,
+                amount=self.principal_amount,
+                reference=ref,
+                narration=f"Disbursement of {self.principal_amount}",
+                performed_by=user,
+            )
+
+            # update loan accounting fields
+            self.disbursed_at = timezone.now()
+            self.status = self.DISBURSED
+            self.outstanding_principal = Decimal(self.principal_amount)
+            self.outstanding_interest = Decimal("0.00")
+            self.save(update_fields=["disbursed_at", "status", "outstanding_principal", "outstanding_interest"])
+
+            # generate schedule entries
+            schedules = self.generate_schedule()
+            for s in schedules:
+                LoanSchedule.objects.create(
+                    loan=self,
+                    installment_number=s["installment_number"],
+                    due_date=(timezone.now().date() + timezone.timedelta(days=30 * s["installment_number"])),
+                    principal_due=s["principal_due"],
+                    interest_due=s["interest_due"],
+                    total_due=s["total_due"],
+                )
+
+            # post ledger entry: loan disbursement is a debit to group funds
+            group = self._get_member_group()
+            LedgerEntry.create_from_source(group=group, amount=self.principal_amount, source=tx, entry_type=LedgerEntry.EntryType.DEBIT, created_by=user)
+
+            return tx
+
+    def apply_repayment(self, amount, user, reference=None):
+        """Apply a repayment amount to the loan. Allocates to scheduled interest first, then principal.
+        Creates LoanTransaction and posts ledger credit to group.
+        """
+        from groups.models import LedgerEntry
+
+        getcontext().rounding = ROUND_HALF_UP
+        amt = Decimal(amount).quantize(Decimal("0.01"))
+
+        with transaction.atomic():
+            # find unpaid schedule installments ordered by due_date
+            unpaid = self.schedule.filter(is_paid=False).order_by("due_date")
+            remaining_payment = amt
+            interest_paid = Decimal("0.00")
+            principal_paid = Decimal("0.00")
+
+            for inst in unpaid:
+                if remaining_payment <= 0:
+                    break
+                to_pay = inst.total_due - (Decimal("0.00") if not inst.payment_transaction else Decimal("0.00"))
+                # allocate to interest first
+                interest_part = min(inst.interest_due, remaining_payment)
+                remaining_payment -= interest_part
+                interest_paid += interest_part
+                inst.interest_due = (inst.interest_due - interest_part).quantize(Decimal("0.01"))
+
+                principal_part = min(inst.principal_due, remaining_payment)
+                remaining_payment -= principal_part
+                principal_paid += principal_part
+                inst.principal_due = (inst.principal_due - principal_part).quantize(Decimal("0.01"))
+
+                paid_total = (interest_part + principal_part).quantize(Decimal("0.01"))
+                if inst.principal_due == Decimal("0.00") and inst.interest_due == Decimal("0.00"):
+                    inst.is_paid = True
+                    inst.paid_at = timezone.now()
+                    inst.paid_by = user
+                inst.save()
+
+            # apply remaining_payment (if any) directly to outstanding_principal
+            if remaining_payment > 0:
+                principal_paid += remaining_payment
+                remaining_payment = Decimal("0.00")
+
+            # update loan outstanding balances
+            self.outstanding_interest = max(Decimal("0.00"), (self.outstanding_interest - interest_paid).quantize(Decimal("0.01")))
+            self.outstanding_principal = max(Decimal("0.00"), (self.outstanding_principal - principal_paid).quantize(Decimal("0.01")))
+            if self.outstanding_principal == Decimal("0.00") and self.outstanding_interest == Decimal("0.00"):
+                self.status = self.CLOSED
+            self.save(update_fields=["outstanding_interest", "outstanding_principal", "status"])
+
+            # create loan transaction
+            ref = reference or f"LR-{uuid.uuid4().hex[:12]}"
+            tx = LoanTransaction.objects.create(
+                loan=self,
+                transaction_type=LoanTransaction.REPAYMENT,
+                amount=amt,
+                reference=ref,
+                narration=f"Repayment {amt} (principal {principal_paid}, interest {interest_paid})",
+                performed_by=user,
+            )
+
+            # link any paid installments to this transaction if fully paid
+            for inst in self.schedule.filter(is_paid=True, payment_transaction__isnull=True):
+                inst.payment_transaction = tx
+                inst.paid_by = user
+                inst.paid_at = timezone.now()
+                inst.save(update_fields=["payment_transaction", "paid_by", "paid_at"])
+
+            # post ledger entry: repayment is credit to group funds
+            group = self._get_member_group()
+            LedgerEntry.create_from_source(group=group, amount=amt, source=tx, entry_type=LedgerEntry.EntryType.CREDIT, created_by=user)
+
+            return tx
+
 
 # Loan Schedule
 class LoanSchedule(models.Model):
@@ -415,9 +594,8 @@ class LoanSchedule(models.Model):
     def __str__(self):
         return f"{self.loan.loan_number} - Installment {self.installment_number}"
 
+
 # Loan Transactions
-
-
 class LoanTransaction(models.Model):
     """
     LoadTransactions contains loan disbursements & repayments transactions
