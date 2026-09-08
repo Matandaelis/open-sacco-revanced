@@ -1,0 +1,16 @@
+{# Include this partial in your loan detail template to mount the React accounting preview UI. #}
+{# Usage: {% include 'accounting/loan_preview_embed.html' %} #}
+
+{# Expected context variables: #}
+{#  - loan (object with application_number attribute) #}
+{#  - request (so request.user is available for auth token and json_script) #}
+
+<div id="loan-detail-root"
+     data-application-number="{{ loan.application_number }}"
+     data-token="{% if request.user.is_authenticated and request.user.auth_token %}{{ request.user.auth_token.key }}{% endif %}"
+     data-user='{{ request.user|json_script:"currentUser" }}'>
+</div>
+
+{# Include the compiled frontend bundle that contains frontend/src/bootstrap_loan_detail.js #}
+{# Adjust the path to your static bundle output (e.g. /static/js/main.js) if different. #}
+<script src="{% static 'js/main.js' %}"></script>
