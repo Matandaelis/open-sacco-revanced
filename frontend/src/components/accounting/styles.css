@@ -1,0 +1,81 @@
+/* Basic styling for the accounting preview modals and table */
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal {
+  background: #fff;
+  padding: 20px;
+  width: 720px;
+  max-width: 95%;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+}
+
+.modal label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.modal input,
+.modal textarea {
+  width: 100%;
+  padding: 8px;
+  margin-top: 4px;
+  margin-bottom: 12px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.modal .muted {
+  background: #eee;
+}
+
+.error {
+  color: #b00020;
+  margin-top: 8px;
+}
+
+.preview-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.preview-table th, .preview-table td {
+  padding: 8px;
+  border-bottom: 1px solid #eee;
+}
+
+.preview-table .right {
+  text-align: right;
+}
+
+.balance-indicator {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 4px;
+}
+
+.balance-indicator.balanced {
+  background: #e6ffed;
+  color: #137333;
+}
+
+.balance-indicator.unbalanced {
+  background: #fff4e6;
+  color: #663c00;
+}
